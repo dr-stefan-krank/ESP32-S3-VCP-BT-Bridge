@@ -1,14 +1,29 @@
+#ifndef CMD_H
+#define CMD_H
+
+#include "freertos/FreeRTOS.h" // Hinzufügen für FreeRTOS Basistypen
+#include "freertos/task.h"     // Hinzufügen für TaskHandle_t
+
 #include "esp_gatts_api.h"
 
-typedef enum {BLE_CONNECT_EVT, BLE_AUTH_EVT, BLE_WRITE_EVT, BLE_DISCONNECT_EVT, BLE_UART_EVT} COMMAND;
+typedef enum {
+    BLE_CONNECT_EVT,
+    BLE_AUTH_EVT,
+    BLE_WRITE_EVT,
+    BLE_DISCONNECT_EVT,
+    BLE_UART_EVT
+} COMMAND;
 
 #define PAYLOAD_SIZE 128
 
 typedef struct {
-	uint16_t spp_conn_id;
-	esp_gatt_if_t spp_gatts_if;
-	uint16_t spp_event_id;
-	size_t length;
-	uint8_t payload[PAYLOAD_SIZE];
-	TaskHandle_t taskHandle;
+    uint16_t spp_conn_id;
+    esp_gatt_if_t spp_gatts_if;
+    uint16_t spp_event_id;
+    size_t length;
+    uint8_t payload[PAYLOAD_SIZE];
+    TaskHandle_t taskHandle; // Jetzt sollte TaskHandle_t bekannt sein
 } CMD_t;
+
+
+#endif // CMD_H

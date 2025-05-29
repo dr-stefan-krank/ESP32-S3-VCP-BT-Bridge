@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "cmd.h"
 #include "driver/uart.h"
 #include "esp_bt_defs.h"
 #include "esp_bt_main.h"
@@ -20,7 +21,6 @@
 #include "usb/vcp_ch34x.hpp"
 #include "usb/vcp_cp210x.hpp"
 #include "usb/vcp_ftdi.hpp"
-#include "cmd.h"
 
 using namespace esp_usb;
 
@@ -43,7 +43,6 @@ using namespace esp_usb;
 
 QueueHandle_t xQueueSpp;
 QueueHandle_t xQueueUartTX;
-
 
 extern "C" void spp_task(void *arg);
 
@@ -86,7 +85,7 @@ static void handle_event(const cdc_acm_host_dev_event_data_t *event,
             led_vcp = 0;
             xSemaphoreGive(led_sync);
 
-            //ESP_LOGI(TAG, "%s", err_text);
+            // ESP_LOGI(TAG, "%s", err_text);
             bt_log(err_text);
             xSemaphoreGive(device_disconnected_sem);
             break;
@@ -97,7 +96,7 @@ static void handle_event(const cdc_acm_host_dev_event_data_t *event,
             led_vcp = 0;
             xSemaphoreGive(led_sync);
 
-            //ESP_LOGI(TAG, "%s", err_text);
+            // ESP_LOGI(TAG, "%s", err_text);
             bt_log(err_text);
             break;
         case CDC_ACM_HOST_NETWORK_CONNECTION:
@@ -131,7 +130,7 @@ static void uart_tx_task(void *pvParameters) {
 
     while (1) {
         if (vcp == nullptr) {
-            //ESP_LOGI(TAG, "VCP device not open.");
+            // ESP_LOGI(TAG, "VCP device not open.");
             vTaskDelay(100);
             continue;
         }
@@ -143,16 +142,16 @@ static void uart_tx_task(void *pvParameters) {
         BaseType_t err = vcp->tx_blocking(cmdBuf.payload, cmdBuf.length, 1000);
         while (err == ESP_ERR_TIMEOUT) {
             ESP_LOGE(TAG, "uart_tx_task Timeout");
-            vTaskDelay(15/portTICK_PERIOD_MS);
+            vTaskDelay(15 / portTICK_PERIOD_MS);
             err = vcp->tx_blocking(cmdBuf.payload, cmdBuf.length, 1000);
         }
 
         BaseType_t sem = xSemaphoreTake(led_sync, 1);
         if (sem == pdTRUE) {
-        led_tx = 1;
-        xSemaphoreGive(led_sync);
+            led_tx = 1;
+            xSemaphoreGive(led_sync);
         }
-        //vTaskDelay(20/portTICK_PERIOD_MS);
+        // vTaskDelay(20/portTICK_PERIOD_MS);
     }  // end while
     // Never reach here
     vTaskDelete(NULL);
@@ -183,8 +182,8 @@ static bool handle_rx(const uint8_t *data, size_t data_len, void *arg) {
 
     BaseType_t sem = xSemaphoreTake(led_sync, 1);
     if (sem == pdTRUE) {
-      led_rx = 1;
-      xSemaphoreGive(led_sync);
+        led_rx = 1;
+        xSemaphoreGive(led_sync);
     }
 
     return true;
@@ -208,18 +207,18 @@ static void vcp_open_task(void *arg) {
         // You don't need to know the device's VID and PID. Just plug in any
         // device and the VCP service will load correct (already registered)
         // driver for the device
-        //ESP_LOGI(TAG, "Opening any VCP device...");
+        // ESP_LOGI(TAG, "Opening any VCP device...");
 
         vcp = std::unique_ptr<CdcAcmDevice>(VCP::open(&dev_config));
 
         if (vcp == nullptr) {
-            //ESP_LOGI(TAG, "Failed to open VCP device");
+            // ESP_LOGI(TAG, "Failed to open VCP device");
             bt_log(">>Failed to open VCP device");
             continue;
         }
         vTaskDelay(10);
 
-        //ESP_LOGI(TAG, "Setting up line coding");
+        // ESP_LOGI(TAG, "Setting up line coding");
         cdc_acm_line_coding_t line_coding = {
             .dwDTERate = EXAMPLE_BAUDRATE,
             .bCharFormat = EXAMPLE_STOP_BITS,
@@ -243,7 +242,8 @@ static void vcp_open_task(void *arg) {
         xSemaphoreGive(led_sync);
 
         // We are done. Wait for device disconnection and start over
-        //ESP_LOGI(TAG, "Done. You can reconnect the VCP device to run again.");
+        // ESP_LOGI(TAG, "Done. You can reconnect the VCP device to run
+        // again.");
         xSemaphoreTake(device_disconnected_sem, portMAX_DELAY);
         vTaskDelay(10);
     }
@@ -294,7 +294,7 @@ led_strip_handle_t configure_led(void) {
     led_strip_handle_t led_strip;
     ESP_ERROR_CHECK(
         led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip));
-    //ESP_LOGI(TAG, "Created LED strip object with RMT backend");
+    // ESP_LOGI(TAG, "Created LED strip object with RMT backend");
     return led_strip;
 }
 
@@ -365,7 +365,8 @@ static void ledTask(void *arg) {
                                         led_strip, 0, 0, 100, 0));
                                     ESP_ERROR_CHECK(
                                         led_strip_refresh(led_strip));
-                                    vTaskDelay(LED_BLINK_TIME / portTICK_PERIOD_MS);
+                                    vTaskDelay(LED_BLINK_TIME /
+                                               portTICK_PERIOD_MS);
                                     ESP_ERROR_CHECK(led_strip_set_pixel(
                                         led_strip, 0, 0, 0, 0));
                                     ESP_ERROR_CHECK(
@@ -376,7 +377,8 @@ static void ledTask(void *arg) {
                                             led_strip, 0, 0, 0, 0));
                                         ESP_ERROR_CHECK(
                                             led_strip_refresh(led_strip));
-                                        vTaskDelay(LED_BLINK_TIME / portTICK_PERIOD_MS);
+                                        vTaskDelay(LED_BLINK_TIME /
+                                                   portTICK_PERIOD_MS);
                                         ESP_ERROR_CHECK(led_strip_set_pixel(
                                             led_strip, 0, 0, 0, 0));
                                         ESP_ERROR_CHECK(
@@ -391,14 +393,14 @@ static void ledTask(void *arg) {
         }
 
         xSemaphoreTake(led_sync, portMAX_DELAY);
-        if(l_rx) {
+        if (l_rx) {
             led_rx = 0;
         }
-        if(l_tx) {
+        if (l_tx) {
             led_tx = 0;
         }
         xSemaphoreGive(led_sync);
-        vTaskDelay(LED_BLINK_TIME/portTICK_PERIOD_MS);
+        vTaskDelay(LED_BLINK_TIME / portTICK_PERIOD_MS);
     }
 }
 
@@ -418,7 +420,7 @@ extern "C" void app_main(void) {
     ESP_ERROR_CHECK(ret);
 
     // Install USB Host driver. Should only be called once in entire application
-    //ESP_LOGI(TAG, "Installing USB Host");
+    // ESP_LOGI(TAG, "Installing USB Host");
     usb_host_config_t host_config = {};
     host_config.skip_phy_setup = false;
     host_config.intr_flags = ESP_INTR_FLAG_LEVEL1;
@@ -429,7 +431,7 @@ extern "C" void app_main(void) {
         xTaskCreate(usb_lib_task, "usb_lib", 4096, NULL, 10, NULL);
     assert(task_created == pdTRUE);
 
-    //ESP_LOGI(TAG, "Installing CDC-ACM driver");
+    // ESP_LOGI(TAG, "Installing CDC-ACM driver");
     ESP_ERROR_CHECK(cdc_acm_host_install(NULL));
 
     // Register VCP drivers to VCP service
