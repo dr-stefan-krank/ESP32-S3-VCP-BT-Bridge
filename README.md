@@ -44,6 +44,8 @@ python ble-serial -d <BLE_MAC_ADDRESS> -p COM5 -r 0000abf2-0000-1000-8000-00805f
 - Replace `COM5` with the desired COM port name. You may need to run the script in a Python environment with the required dependencies installed.
 - Note: Windows support is untested. If you encounter issues, please report them.
 
+Please see original repository of ble-serial for instructions on how to use it in windows.
+
 #### Exiting the Client
 - Type `~.` (tilde followed by a dot) at the beginning of a line to exit the client cleanly.
 
