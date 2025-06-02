@@ -1,0 +1,195 @@
+#!/home/aw/python3/ble/bin/python3
+# -*- coding: utf-8 -*-
+import re
+import sys
+import serial
+import os
+import atexit
+import termios
+import tty
+import time
+import errno
+import signal
+signal.signal(signal.SIGINT, signal.SIG_IGN)
+from threading import Thread
+from ble_serial.main import launch
+import asyncio
+from functools import partial
+
+class UserExit(Exception):
+    """User-requested clean exit with ~."""
+    pass
+
+
+def setup_serial(max_retries=3, retry_delay=5):
+    """Wait for device and setup serial connection with retries"""
+    for attempt in range(max_retries):
+        try:
+            # Wait for device to be available
+            start_time = time.time()
+            timeout = 10  # seconds
+            
+            while not os.path.exists('/tmp/ttyBLE'):
+                if time.time() - start_time > timeout:
+                    raise TimeoutError(f"Timeout waiting for /tmp/ttyBLE (attempt {attempt + 1}/{max_retries})")
+                time.sleep(0.1)
+            
+            # Give BLE stack time to initialize
+            time.sleep(2)
+            
+            # Try to open serial connection
+            ser = serial.Serial(
+                port='/tmp/ttyBLE',
+                baudrate=115200,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=0.1
+            )
+                        
+            time.sleep(0.1)
+            
+            if ser.is_open:
+                print(f"Successfully connected on attempt {attempt + 1}")
+                return ser
+                
+        except (serial.SerialException, TimeoutError) as e:
+            print(f"Connection attempt {attempt + 1} failed: {str(e)}")
+            if attempt < max_retries - 1:
+                print(f"Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+                cleanup_stale_device()  # Clean up before retry
+                
+                # Restart BLE connection
+                launch_thread = Thread(target=launch)
+                launch_thread.daemon = True
+                launch_thread.start()
+            else:
+                raise RuntimeError(f"Failed to connect after {max_retries} attempts")
+
+def cleanup_stale_device():
+    """Remove stale device files if they exist"""
+    device_paths = ['/tmp/ttyBLE']
+    for path in device_paths:
+        try:
+            if os.path.exists(path) or os.path.islink(path):
+                os.unlink(path)
+                print(f"Removed stale device file: {path}")
+        except OSError as e:
+            print(f"Warning: Could not remove {path}: {e}", file=sys.stderr)
+
+
+def terminal_reader(ser):
+    """Read from terminal and write to serial, use ~. at beginning of line to exit"""
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+
+    try:
+        print("Terminal in raw mode - type away! (~. at line start to exit)")
+        tty.setraw(fd)
+
+        buffer = b''
+        at_line_start = True
+
+        while True:
+            char = sys.stdin.buffer.read(1)
+            if not char:
+                continue
+
+            buffer += char
+
+            # Exit sequence
+            if at_line_start and buffer == b'~.':
+                raise UserExit()
+
+            if at_line_start and not b'~.'.startswith(buffer):
+                ser.write(buffer)
+                ser.flush()
+                buffer = b''
+                at_line_start = False
+            elif not at_line_start:
+                ser.write(char)
+                ser.flush()
+                buffer = b''
+
+            if char in (b'\n', b'\r'):
+                at_line_start = True
+            elif buffer == b'':
+                at_line_start = False
+
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+def serial_reader(ser):
+    """Read from serial and write to terminal"""
+    try:
+        while ser.is_open:
+            if ser.in_waiting:
+                char = ser.read()
+                if not char:
+                    continue
+                sys.stdout.buffer.write(char)
+                sys.stdout.buffer.flush()
+            else:
+                time.sleep(0.01)
+    except Exception as e:
+        # Don't crash if serial is closed during exit
+        pass
+
+def watch_connection(ser):
+    """Monitor connection status and attempt reconnection if needed"""
+    while True:
+        try:
+            if not ser.is_open:
+                print("\nConnection lost! Attempting to reconnect...")
+                ser = setup_serial()
+                if ser.is_open:
+                    print("Reconnected successfully!")
+            time.sleep(1)
+        except Exception as e:
+            print(f"Reconnection failed: {str(e)}")
+            time.sleep(5)  # Wait before next attempt
+
+def cleanup(ser):
+    """Cleanup function to close serial port"""
+    if ser and ser.is_open:
+        ser.close()
+
+if __name__ == '__main__':
+    sys.argv[0] = re.sub(r'(-script\.pyw|\.exe)?$', '', sys.argv[0])
+    
+    # Clean up stale device files
+    cleanup_stale_device()
+    
+    print("Starting BLE serial bridge...")
+    
+    # Launch BLE device creation
+    launch_thread = Thread(target=launch)
+    launch_thread.daemon = True
+    launch_thread.start()
+    
+    # Setup serial connection
+    print("Waiting for BLE device to be ready...")
+    ser = setup_serial()
+    atexit.register(cleanup, ser)
+    
+    # Start reader thread
+    print("Starting serial reader thread...")
+    serial_thread = Thread(target=serial_reader, args=(ser,))
+    serial_thread.daemon = True
+    serial_thread.start()
+    
+    try:
+        # Start connection monitor
+        watch_thread = Thread(target=watch_connection, args=(ser,))
+        watch_thread.daemon = True
+        watch_thread.start()
+        
+        # Run terminal reader in main thread
+        terminal_reader(ser)
+    except UserExit:
+        print("\nUser exit requested. BLE serial bridge terminated successfully.")        
+    except Exception as e:
+        print(f"\nError: {str(e)}")
+    finally:
+        cleanup(ser)
+        sys.exit(0)
