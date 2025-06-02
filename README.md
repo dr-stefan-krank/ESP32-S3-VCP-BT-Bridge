@@ -64,3 +64,5 @@ The LED will update in real time to reflect the current connection and data tran
 ## Troubleshooting
 - For USB-Serial issues, check your cable and that the device is supported. If needed add the VID and PID to the drivers sources in the components folder.
 
+## Origin and License
+- This work is directly derived from Espressifs example code from the ESP-IDF and thus inherits their licenses
