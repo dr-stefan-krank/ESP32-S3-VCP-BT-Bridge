@@ -1,11 +1,11 @@
-/*	BLE SPP Server Example
+/*
+    BLE SPP Server Example
 
-        This example code is in the Public Domain (or CC0 licensed, at your
-   option.)
+    This example code is in the Public Domain (or CC0 licensed, at your option.)
 
-        Unless required by applicable law or agreed to in writing, this
-        software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-        CONDITIONS OF ANY KIND, either express or implied.
+    Unless required by applicable law or agreed to in writing, this software is
+   distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+   KIND, either express or implied.
 */
 #include <inttypes.h>
 #include <stdio.h>
@@ -16,8 +16,11 @@
 #include "esp_bt_defs.h"
 #include "esp_bt_main.h"
 #include "esp_gap_ble_api.h"
+#include "esp_gatt_common_api.h"
 #include "esp_gatts_api.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_psram.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -31,7 +34,16 @@ static const char *TAG = "SPP";
 #define DEVICE_NAME "ESP_SPP_SERVER"  // The Device Name Characteristics in GAP
 
 #define SPP_SVC_INST_ID 0
-#define SPP_DATA_MAX_LEN (512)
+
+#define FLOW_CONTROL_OFF 0x00
+#define FLOW_CONTROL_ON 0x01
+
+#define SPP_QUEUE_LEN 256
+#define UART_QUEUE_LEN 256
+#define FLOW_CHECK_INTERVAL_MS 50
+#define QUEUE_SEND_TIMEOUT_MS 10
+
+static bool ble_flow_paused = false;
 
 /// Attributes State Machine
 enum {
@@ -161,27 +173,30 @@ static const uint16_t character_client_config_uuid =
 
 static const uint8_t char_prop_read_notify =
     ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_NOTIFY;
-static const uint8_t char_prop_read_write =
-    ESP_GATT_CHAR_PROP_BIT_WRITE_NR | ESP_GATT_CHAR_PROP_BIT_READ;
 
-/// SPP Service - data receive characteristic, read&write without response
+static const uint8_t char_prop_read_write =
+    ESP_GATT_CHAR_PROP_BIT_WRITE |  // Write with response
+    ESP_GATT_CHAR_PROP_BIT_READ;    // Remove write without response for now
+
+/// SPP Service - data receive characteristic, read & write with/without
+/// response
 static const uint16_t spp_data_receive_uuid = ESP_GATT_UUID_SPP_DATA_RECEIVE;
-static const uint8_t spp_data_receive_val[20] = {0x00};
+static const uint8_t spp_data_receive_val[SPP_DATA_MAX_LEN] = {0x00};
 
 /// SPP Service - data notify characteristic, notify&read
 static const uint16_t spp_data_notify_uuid = ESP_GATT_UUID_SPP_DATA_NOTIFY;
-static const uint8_t spp_data_notify_val[20] = {0x00};
+static const uint8_t spp_data_notify_val[SPP_DATA_MAX_LEN] = {0x00};
 static const uint8_t spp_data_notify_ccc[2] = {0x00, 0x00};
 
 /// Full HRS Database Description - Used to add attributes into the database
 static const esp_gatts_attr_db_t spp_gatt_db[SPP_IDX_NB] = {
-    // SPP -  Service Declaration
+    // Service Declaration
     [SPP_IDX_SVC] = {{ESP_GATT_AUTO_RSP},
                      {ESP_UUID_LEN_16, (uint8_t *)&primary_service_uuid,
                       ESP_GATT_PERM_READ, sizeof(spp_service_uuid),
                       sizeof(spp_service_uuid), (uint8_t *)&spp_service_uuid}},
 
-    // SPP -  data receive characteristic Declaration
+    // Data Receive Characteristic Declaration
     [SPP_IDX_SPP_DATA_RECV_CHAR] = {{ESP_GATT_AUTO_RSP},
                                     {ESP_UUID_LEN_16,
                                      (uint8_t *)&character_declaration_uuid,
@@ -189,21 +204,21 @@ static const esp_gatts_attr_db_t spp_gatt_db[SPP_IDX_NB] = {
                                      CHAR_DECLARATION_SIZE,
                                      (uint8_t *)&char_prop_read_write}},
 
-    // SPP -  data receive characteristic Value
+    // Data Receive Characteristic Value
     [SPP_IDX_SPP_DATA_RECV_VAL] =
-        {{ESP_GATT_AUTO_RSP},
+        {{ESP_GATT_RSP_BY_APP},  // Change from AUTO_RSP to RSP_BY_APP
          {ESP_UUID_LEN_16, (uint8_t *)&spp_data_receive_uuid,
           ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE, SPP_DATA_MAX_LEN,
           sizeof(spp_data_receive_val), (uint8_t *)spp_data_receive_val}},
 
-    // SPP -  data notify characteristic Declaration
+    // Data Notify Characteristic Declaration
     [SPP_IDX_SPP_DATA_NOTIFY_CHAR] =
         {{ESP_GATT_AUTO_RSP},
          {ESP_UUID_LEN_16, (uint8_t *)&character_declaration_uuid,
           ESP_GATT_PERM_READ, CHAR_DECLARATION_SIZE, CHAR_DECLARATION_SIZE,
           (uint8_t *)&char_prop_read_notify}},
 
-    // SPP -  data notify characteristic Value
+    // Data Notify Characteristic Value
     [SPP_IDX_SPP_DATA_NOTIFY_VAL] = {{ESP_GATT_AUTO_RSP},
                                      {ESP_UUID_LEN_16,
                                       (uint8_t *)&spp_data_notify_uuid,
@@ -211,14 +226,12 @@ static const esp_gatts_attr_db_t spp_gatt_db[SPP_IDX_NB] = {
                                       sizeof(spp_data_notify_val),
                                       (uint8_t *)spp_data_notify_val}},
 
-    // SPP -  data notify characteristic - Client Characteristic Configuration
-    // Descriptor
-    [SPP_IDX_SPP_DATA_NOTIFY_CFG] =
-        {{ESP_GATT_AUTO_RSP},
-         {ESP_UUID_LEN_16, (uint8_t *)&character_client_config_uuid,
-          ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE, sizeof(uint16_t),
-          sizeof(spp_data_notify_ccc), (uint8_t *)spp_data_notify_ccc}},
-};
+    // Client Characteristic Configuration Descriptor
+    [SPP_IDX_SPP_DATA_NOTIFY_CFG] = {
+        {ESP_GATT_AUTO_RSP},
+        {ESP_UUID_LEN_16, (uint8_t *)&character_client_config_uuid,
+         ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE, sizeof(uint16_t),
+         sizeof(spp_data_notify_ccc), (uint8_t *)spp_data_notify_ccc}}};
 
 static char *esp_key_type_to_str(esp_ble_key_type_t key_type) {
     char *key_str = NULL;
@@ -418,7 +431,7 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event,
             cmdBuf.spp_event_id = BLE_AUTH_EVT;
             err = xQueueSendFromISR(xQueueSpp, &cmdBuf, NULL);
             if (err != pdTRUE) {
-                ESP_LOGE(TAG, "xQueueSendFromISR Fail");
+                ESP_LOGE(__FUNCTION__, "Failed to send to queue from ISR");
             }
             break;
         }
@@ -495,35 +508,69 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event,
                                           SPP_SVC_INST_ID);
             break;
         case ESP_GATTS_READ_EVT:
+            if (find_char_and_desr_index(param->read.handle) ==
+                SPP_IDX_SPP_DATA_RECV_VAL) {
+                ESP_LOGI(TAG, "ESP_GATTS_READ_EVT, handle = %d",
+                         param->read.handle);
+                esp_gatt_rsp_t rsp;
+                memset(&rsp, 0, sizeof(esp_gatt_rsp_t));
+                rsp.attr_value.handle = param->read.handle;
+                rsp.attr_value.len = SPP_DATA_MAX_LEN;
+                if (rsp.attr_value.len > ESP_GATT_MAX_ATTR_LEN) {
+                    rsp.attr_value.len = ESP_GATT_MAX_ATTR_LEN;
+                }
+                memcpy(rsp.attr_value.value, spp_data_receive_val,
+                       rsp.attr_value.len);
+                esp_ble_gatts_send_response(gatts_if, param->read.conn_id,
+                                            param->read.trans_id, ESP_GATT_OK,
+                                            &rsp);
+            }
             break;
-        case ESP_GATTS_WRITE_EVT:
+        case ESP_GATTS_WRITE_EVT: {
             ESP_LOGI(__FUNCTION__, "ESP_GATTS_WRITE_EVT");
-            uint8_t res = find_char_and_desr_index(p_data->write.handle);
-            ESP_LOGI(__FUNCTION__, "find_char_and_desr_index=%d", res);
-            if (res == SPP_IDX_SPP_DATA_RECV_VAL) {
-                esp_log_buffer_hex(__FUNCTION__, param->write.value,
-                                   param->write.len);
+            if (find_char_and_desr_index(param->write.handle) ==
+                SPP_IDX_SPP_DATA_RECV_VAL) {
+                if (param->write.len > PAYLOAD_SIZE) {
+                    ESP_LOGE(__FUNCTION__, "Write data too long: %d > %d",
+                             param->write.len, PAYLOAD_SIZE);
+                    // Send error response
+                    esp_gatt_rsp_t rsp;
+                    memset(&rsp, 0, sizeof(esp_gatt_rsp_t));
+                    rsp.attr_value.handle = param->write.handle;
+                    esp_ble_gatts_send_response(
+                        gatts_if, param->write.conn_id, param->write.trans_id,
+                        ESP_GATT_INVALID_ATTR_LEN, &rsp);
+                    break;
+                }
+
+                // Process the write data with safe copy
                 cmdBuf.spp_event_id = BLE_WRITE_EVT;
                 cmdBuf.length = param->write.len;
-                if (cmdBuf.length > PAYLOAD_SIZE) cmdBuf.length = PAYLOAD_SIZE;
-                memcpy(cmdBuf.payload, (char *)param->write.value,
-                       cmdBuf.length);
+                memcpy(cmdBuf.payload, param->write.value, cmdBuf.length);
 
-                err = xQueueSendFromISR(xQueueSpp, &cmdBuf, NULL);
+                // Send to queue with timeout
+                BaseType_t err =
+                    xQueueSend(xQueueSpp, &cmdBuf, pdMS_TO_TICKS(100));
 
-                /*
-                        while (err == errQUEUE_FULL) {
-                                ESP_LOGE(TAG, "xQueueSendFromISR Queue Full");
-                                vTaskDelay(15/portTICK_PERIOD_MS);
-                                err = xQueueSendFromISR(xQueueSpp, &cmdBuf,
-                   NULL);
-                        }
-                        */
-                if (err != pdTRUE) {
-                    ESP_LOGE(TAG, "xQueueSendFromISR Fail");
+                // Always send response for write operations
+                esp_gatt_rsp_t rsp;
+                memset(&rsp, 0, sizeof(esp_gatt_rsp_t));
+                rsp.attr_value.handle = param->write.handle;
+                rsp.attr_value.len = 0;
+
+                if (err == pdTRUE) {
+                    esp_ble_gatts_send_response(gatts_if, param->write.conn_id,
+                                                param->write.trans_id,
+                                                ESP_GATT_OK, &rsp);
+                } else {
+                    // Queue full - send error response
+                    esp_ble_gatts_send_response(gatts_if, param->write.conn_id,
+                                                param->write.trans_id,
+                                                ESP_GATT_CONGESTED, &rsp);
                 }
             }
             break;
+        }
         case ESP_GATTS_EXEC_WRITE_EVT:
             break;
         case ESP_GATTS_MTU_EVT:
@@ -556,17 +603,25 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event,
             ESP_LOGI(__FUNCTION__, "ESP_GATTS_CONNECT_EVT, conn_id = %d",
                      param->connect.conn_id);
             esp_log_buffer_hex(__FUNCTION__, param->connect.remote_bda, 6);
+
+            // --- BLE MTU and connection interval tuning ---
+            // Set maximum possible MTU (up to 517 for BLE)
+            esp_err_t mtu_ret = esp_ble_gatt_set_local_mtu(517);
+            if (mtu_ret != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to set local MTU: %s",
+                         esp_err_to_name(mtu_ret));
+            } else {
+                ESP_LOGI(TAG, "Requested BLE MTU 517");
+            }
+
+            // Tune connection interval for higher throughput
             esp_ble_conn_update_params_t conn_params = {0};
             memcpy(conn_params.bda, param->connect.remote_bda,
                    sizeof(esp_bd_addr_t));
-            /* For the IOS system, please reference the apple official documents
-             * about the ble connection parameters restrictions. */
             conn_params.latency = 0;
-            conn_params.max_int = 0x40;  // max_int = 0x20*1.25ms = 40ms
-            conn_params.min_int = 0x20;  // min_int = 0x10*1.25ms = 20ms
-            // conn_params.timeout = 1000;    // timeout = 400*10ms = 4000ms
-            conn_params.timeout = 0x0C80;  // timeout
-            // start sent the update connection parameters to the peer device.
+            conn_params.max_int = 0x10;    // 20ms (0x10 * 1.25ms)
+            conn_params.min_int = 0x10;    // 20ms
+            conn_params.timeout = 0x0C80;  // 4s
             esp_ble_gap_update_conn_params(&conn_params);
 
             break;
@@ -645,6 +700,43 @@ static void gatts_event_handler(esp_gatts_cb_event_t event,
     } while (0);
 }
 
+void spp_init_queues(void) {
+    size_t queue_len = 256;  // Large queue for bursty serial data
+    size_t cmd_size = sizeof(CMD_t);
+
+    // Check if PSRAM is available
+    if (esp_psram_is_initialized()) {
+        ESP_LOGI(TAG, "PSRAM detected. Allocating queues in PSRAM.");
+        // Allocate queue storage in PSRAM
+        void *spp_queue_storage = heap_caps_malloc(
+            queue_len * cmd_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        void *uart_queue_storage = heap_caps_malloc(
+            queue_len * cmd_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+        if (spp_queue_storage && uart_queue_storage) {
+            xQueueSpp = xQueueCreateStatic(SPP_QUEUE_LEN, sizeof(CMD_t),
+                                           spp_queue_storage, NULL);
+            if (xQueueSpp == NULL) {
+                ESP_LOGE(TAG, "xQueueSpp creation failed!");
+                abort();
+            }
+            xQueueUartTX = xQueueCreateStatic(queue_len, cmd_size,
+                                              uart_queue_storage, NULL);
+            ESP_LOGI(TAG, "Queues allocated in PSRAM, length=%d", queue_len);
+        } else {
+            ESP_LOGE(TAG,
+                     "Failed to allocate queues in PSRAM, falling back to "
+                     "normal RAM.");
+            xQueueSpp = xQueueCreate(queue_len / 2, cmd_size);
+            xQueueUartTX = xQueueCreate(queue_len / 2, cmd_size);
+        }
+    } else {
+        ESP_LOGW(TAG, "No PSRAM detected. Using internal RAM for queues.");
+        xQueueSpp = xQueueCreate(32, cmd_size);
+        xQueueUartTX = xQueueCreate(32, cmd_size);
+    }
+}
+
 void spp_task(void *arg) {
     ESP_LOGI(pcTaskGetName(0), "Start");
 
@@ -652,139 +744,114 @@ void spp_task(void *arg) {
 
     esp_err_t ret;
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+
+    // Initialize BLE controller
     if ((ret = esp_bt_controller_init(&bt_cfg)) != ESP_OK) {
-        ESP_LOGE(TAG, "%s init controller failed: %s", __func__,
-                 esp_err_to_name(ret));
+        ESP_LOGE(TAG, "initialize controller failed: %s", esp_err_to_name(ret));
+        vTaskDelete(NULL);
         return;
     }
-
-    if ((ret = esp_bt_controller_enable(ESP_BT_MODE_BLE)) != ESP_OK) {
-        ESP_LOGE(TAG, "%s enable controller failed: %s", __func__,
-                 esp_err_to_name(ret));
-        return;
-    }
-
-#if (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 2, 0))
-    esp_bluedroid_config_t bluedroid_cfg = BT_BLUEDROID_INIT_CONFIG_DEFAULT();
-    if ((ret = esp_bluedroid_init_with_cfg(&bluedroid_cfg)) != ESP_OK) {
-        ESP_LOGE(TAG, "%s initialize bluedroid failed: %s", __func__,
-                 esp_err_to_name(ret));
-        return;
-    }
-#else
-    if ((ret = esp_bluedroid_init()) != ESP_OK) {
-        ESP_LOGE(TAG, "%s init bluedroid failed: %s", __func__,
-                 esp_err_to_name(ret));
-        return;
-    }
-#endif
-
-    if ((ret = esp_bluedroid_enable()) != ESP_OK) {
-        ESP_LOGE(TAG, "%s enable bluetooth failed: %s", __func__,
-                 esp_err_to_name(ret));
-        return;
-    }
-
-    if ((ret = esp_ble_gatts_register_callback(gatts_event_handler)) !=
-        ESP_OK) {
-        ESP_LOGE(TAG, "gatts register error, error code = %x", ret);
-        return;
-    }
-
-    if ((ret = esp_ble_gap_register_callback(gap_event_handler)) != ESP_OK) {
-        ESP_LOGE(TAG, "gap register error, error code = %x", ret);
-        return;
-    }
-
-    if ((ret = esp_ble_gatts_app_register(ESP_SPP_APP_ID)) != ESP_OK) {
-        ESP_LOGE(TAG, "gatts app register error, error code = %x", ret);
-        return;
-    }
-
-    /* set the security iocap & auth_req & key size & init key response key
-     * parameters to the stack*/
-    esp_ble_auth_req_t auth_req =
-        ESP_LE_AUTH_REQ_SC_MITM_BOND;  // bonding with peer device after
-                                       // authentication
-    esp_ble_io_cap_t iocap =
-        ESP_IO_CAP_NONE;    // set the IO capability to No output No input
-    uint8_t key_size = 16;  // the key size should be 7~16 bytes
-    uint8_t init_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
-    uint8_t rsp_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
-    // set static passkey
-    uint32_t passkey = 123456;
-    uint8_t auth_option = ESP_BLE_ONLY_ACCEPT_SPECIFIED_AUTH_DISABLE;
-    uint8_t oob_support = ESP_BLE_OOB_DISABLE;
-    esp_ble_gap_set_security_param(ESP_BLE_SM_SET_STATIC_PASSKEY, &passkey,
-                                   sizeof(uint32_t));
-    esp_ble_gap_set_security_param(ESP_BLE_SM_AUTHEN_REQ_MODE, &auth_req,
-                                   sizeof(uint8_t));
-    esp_ble_gap_set_security_param(ESP_BLE_SM_IOCAP_MODE, &iocap,
-                                   sizeof(uint8_t));
-    esp_ble_gap_set_security_param(ESP_BLE_SM_MAX_KEY_SIZE, &key_size,
-                                   sizeof(uint8_t));
-    esp_ble_gap_set_security_param(ESP_BLE_SM_ONLY_ACCEPT_SPECIFIED_SEC_AUTH,
-                                   &auth_option, sizeof(uint8_t));
-    esp_ble_gap_set_security_param(ESP_BLE_SM_OOB_SUPPORT, &oob_support,
-                                   sizeof(uint8_t));
-    /* If your BLE device acts as a Slave, the init_key means you hope which
-    types of key of the master should distribute to you, and the response key
-    means which key you can distribute to the master; If your BLE device acts as
-    a master, the response key means you hope which types of key of the slave
-    should distribute to you, and the init key means which key you can
-    distribute to the slave. */
-    esp_ble_gap_set_security_param(ESP_BLE_SM_SET_INIT_KEY, &init_key,
-                                   sizeof(uint8_t));
-    esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY, &rsp_key,
-                                   sizeof(uint8_t));
-
-    /* Just show how to clear all the bonded devices
-     * Delay 30s, clear all the bonded devices
-     *
-     * vTaskDelay(30000 / portTICK_PERIOD_MS);
-     * remove_all_bonded_devices();
-     */
 
     CMD_t cmdBuf;
     uint16_t spp_conn_id = 0xffff;
     esp_gatt_if_t spp_gatts_if = 0xff;
     bool connected = false;
+    portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+
+    const TickType_t flow_check_interval =
+        FLOW_CHECK_INTERVAL_MS / portTICK_PERIOD_MS;  // 50ms
+    TickType_t last_flow_check = xTaskGetTickCount();
 
     while (1) {
-        xQueueReceive(xQueueSpp, &cmdBuf, portMAX_DELAY);
-        ESP_LOGI(pcTaskGetName(NULL), "cmdBuf.spp_event_id=%d connected=%d",
-                 cmdBuf.spp_event_id, connected);
-        if (cmdBuf.spp_event_id == BLE_CONNECT_EVT) {
-            ESP_LOGI(pcTaskGetName(NULL), "BLE_CONNECT_EVT");
-            spp_conn_id = cmdBuf.spp_conn_id;
-            spp_gatts_if = cmdBuf.spp_gatts_if;
-        } else if (cmdBuf.spp_event_id == BLE_AUTH_EVT) {
-            ESP_LOGI(pcTaskGetName(NULL), "BLE_AUTH_EVT");
-            connected = true;
-        } else if (cmdBuf.spp_event_id == BLE_DISCONNECT_EVT) {
-            ESP_LOGI(pcTaskGetName(NULL), "BLE_DISCONNECT_EVT");
-            connected = false;
-        } else if (cmdBuf.spp_event_id == BLE_UART_EVT) {
-            if (connected) {
+        // Critical section for flow control
+        portENTER_CRITICAL(&mux);
+        if (ble_flow_paused && connected) {
+            if ((xTaskGetTickCount() - last_flow_check) >=
+                flow_check_interval) {
+                last_flow_check = xTaskGetTickCount();
+                portEXIT_CRITICAL(&mux);
+
+                if (uxQueueSpacesAvailable(xQueueUartTX) > 0) {
+                    uint8_t flow_on = FLOW_CONTROL_ON;
+                    esp_ble_gatts_send_indicate(
+                        spp_gatts_if, spp_conn_id,
+                        spp_handle_table[SPP_IDX_SPP_DATA_NOTIFY_VAL], 1,
+                        &flow_on, false);
+
+                    portENTER_CRITICAL(&mux);
+                    ble_flow_paused = false;
+                    portEXIT_CRITICAL(&mux);
+
+                    ESP_LOGI(pcTaskGetName(NULL), "BLE flow control: ON");
+                }
+            } else {
+                portEXIT_CRITICAL(&mux);
+            }
+        } else {
+            portEXIT_CRITICAL(&mux);
+        }
+
+        // Handle queue messages with timeout
+        if (xQueueReceive(xQueueSpp, &cmdBuf,
+                          pdMS_TO_TICKS(QUEUE_SEND_TIMEOUT_MS)) == pdTRUE) {
+            ESP_LOGD(pcTaskGetName(NULL), "cmdBuf.spp_event_id=%d connected=%d",
+                     cmdBuf.spp_event_id, connected);
+
+            // Critical section for connection state changes
+            portENTER_CRITICAL(&mux);
+            if (cmdBuf.spp_event_id == BLE_CONNECT_EVT) {
+                ESP_LOGI(pcTaskGetName(NULL), "BLE_CONNECT_EVT");
+                spp_conn_id = cmdBuf.spp_conn_id;
+                spp_gatts_if = cmdBuf.spp_gatts_if;
+            } else if (cmdBuf.spp_event_id == BLE_AUTH_EVT) {
+                ESP_LOGI(pcTaskGetName(NULL), "BLE_AUTH_EVT");
+                connected = true;
+            } else if (cmdBuf.spp_event_id == BLE_DISCONNECT_EVT) {
+                ESP_LOGI(pcTaskGetName(NULL), "BLE_DISCONNECT_EVT");
+                connected = false;
+                ble_flow_paused = false;
+            }
+            portEXIT_CRITICAL(&mux);
+
+            if (cmdBuf.spp_event_id == BLE_UART_EVT) {
+                if (connected) {
+                    ESP_LOG_BUFFER_HEXDUMP(pcTaskGetName(NULL), cmdBuf.payload,
+                                           cmdBuf.length, ESP_LOG_DEBUG);
+                    // Check payload size before sending
+                    if (cmdBuf.length > PAYLOAD_SIZE) {
+                        ESP_LOGW(pcTaskGetName(NULL),
+                                 "Payload too large (%d > %d), truncating",
+                                 cmdBuf.length, PAYLOAD_SIZE);
+                        cmdBuf.length = PAYLOAD_SIZE;
+                    }
+                    esp_ble_gatts_send_indicate(
+                        spp_gatts_if, spp_conn_id,
+                        spp_handle_table[SPP_IDX_SPP_DATA_NOTIFY_VAL],
+                        cmdBuf.length, cmdBuf.payload, false);
+                }
+            } else if (cmdBuf.spp_event_id == BLE_WRITE_EVT) {
                 ESP_LOG_BUFFER_HEXDUMP(pcTaskGetName(NULL), cmdBuf.payload,
-                                       cmdBuf.length, ESP_LOG_DEBUG);
-                esp_ble_gatts_send_indicate(
-                    spp_gatts_if, spp_conn_id,
-                    spp_handle_table[SPP_IDX_SPP_DATA_NOTIFY_VAL],
-                    cmdBuf.length, cmdBuf.payload, false);
-            }
-        } else if (cmdBuf.spp_event_id == BLE_WRITE_EVT) {
-            ESP_LOG_BUFFER_HEXDUMP(pcTaskGetName(NULL), cmdBuf.payload,
-                                   cmdBuf.length, ESP_LOG_INFO);
+                                       cmdBuf.length, ESP_LOG_INFO);
 
-            // Sende an xQueueUartTX mit einem Timeout, anstatt unendlich zu warten.
-            // (10 Ticks Timeout, anpassen falls nötig)
-            BaseType_t send_err = xQueueSend(xQueueUartTX, &cmdBuf, (TickType_t)10 / portTICK_PERIOD_MS); 
-            if (send_err != pdTRUE) {
-                ESP_LOGE(pcTaskGetName(NULL), "xQueueUartTX ist voll. Paket von BLE wird verworfen, um Blockierung zu vermeiden.");
-                // An dieser Stelle gehen die Daten verloren, wenn der UART-Pfad überlastet ist.
+                BaseType_t send_err =
+                    xQueueSend(xQueueUartTX, &cmdBuf,
+                               pdMS_TO_TICKS(QUEUE_SEND_TIMEOUT_MS));
+                if (send_err != pdTRUE) {
+                    ESP_LOGW(TAG, "Queue full - implementing flow control");
+                    // FLOW CONTROL: Notify client to pause sending
+                    portENTER_CRITICAL(&mux);
+                    if (!ble_flow_paused && connected) {
+                        uint8_t flow_off = FLOW_CONTROL_OFF;
+                        esp_ble_gatts_send_indicate(
+                            spp_gatts_if, spp_conn_id,
+                            spp_handle_table[SPP_IDX_SPP_DATA_NOTIFY_VAL], 1,
+                            &flow_off, false);
+                        ble_flow_paused = true;
+                        ESP_LOGI(pcTaskGetName(NULL), "BLE flow control: OFF");
+                    }
+                    portEXIT_CRITICAL(&mux);
+                }
             }
-
         }
     }  // end while
 

@@ -8,7 +8,9 @@
 #include "esp_bt_main.h"
 #include "esp_gap_ble_api.h"
 #include "esp_gatts_api.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_psram.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
@@ -27,19 +29,22 @@ using namespace esp_usb;
 #include "driver/gpio.h"
 #include "led_strip.h"
 
-// GPIO assignment
-#define LED_STRIP_GPIO_PIN 48
+// GPIO assignment for LED strip
+#define LED_STRIP_GPIO_PIN 48  // Dev Board GPIO for LED strip
 // Numbers of the LED in the strip
 #define LED_STRIP_LED_COUNT 1
 // 10MHz resolution, 1 tick = 0.1us (led strip needs a high resolution)
 #define LED_STRIP_RMT_RES_HZ (10 * 1000 * 1000)
 #define LED_BLINK_TIME 60
 
-// Change these values to match your needs
-#define EXAMPLE_BAUDRATE (115200)
-#define EXAMPLE_STOP_BITS (0)  // 0: 1 stopbit, 1: 1.5 stopbits, 2: 2 stopbits
-#define EXAMPLE_PARITY (0)     // 0: None, 1: Odd, 2: Even, 3: Mark, 4: Space
-#define EXAMPLE_DATA_BITS (8)
+// These values should be the most common for USB-Serial devices
+#define BAUDRATE (115200)
+#define STOP_BITS (0)  // 0: 1 stopbit, 1: 1.5 stopbits, 2: 2 stopbits
+#define PARITY (0)     // 0: None, 1: Odd, 2: Even, 3: Mark, 4: Space
+#define DATA_BITS (8)
+
+#define SPP_QUEUE_LEN 256
+#define UART_QUEUE_LEN 256
 
 QueueHandle_t xQueueSpp;
 QueueHandle_t xQueueUartTX;
@@ -48,11 +53,16 @@ extern "C" void spp_task(void *arg);
 
 static const char *TAG = "VCP example";
 static SemaphoreHandle_t device_disconnected_sem;
-static SemaphoreHandle_t led_sync;
+SemaphoreHandle_t led_sync;  // LED synchronization semaphore
 
-int led_rx = 0;
-int led_tx = 0;
-int led_vcp = 0;
+int led_rx = 0;   // USB-Serial RX activity
+int led_tx = 0;   // USB-Serial TX activity
+int led_vcp = 0;  // USB-Serial connection status
+int led_ble = 0;  // BLE connection status
+
+TickType_t last_ble_activity = 0;
+#define BLE_TIMEOUT_MS \
+    5000  // 5 seconds of inactivity before we consider BLE disconnected
 
 static void bt_log(const char *data);
 std::unique_ptr<CdcAcmDevice> vcp = nullptr;
@@ -60,17 +70,18 @@ std::unique_ptr<CdcAcmDevice> vcp = nullptr;
 /**
  * @brief Device event callback
  *
- * Apart from handling device disconnection it doesn't do anything useful
+ * Handling device disconnection events
  *
  * @param[in] event    Device event type and data
- * @param[in] user_ctx Argument we passed to the device open function
+ * @param[in] user_ctx Argument passed to the device open function
  */
 static void handle_event(const cdc_acm_host_dev_event_data_t *event,
                          void *user_ctx) {
-    char *err_text = new char[128];
+    char err_text[128];
     switch (event->type) {
         case CDC_ACM_HOST_ERROR:
-            snprintf(err_text, 128, ">>CDC-ACM error has occurred, err_no = %d",
+            snprintf(err_text, sizeof(err_text),
+                     ">>CDC-ACM error has occurred, err_no = %d",
                      event->data.error);
             xSemaphoreTake(led_sync, portMAX_DELAY);
             led_vcp = 0;
@@ -80,23 +91,24 @@ static void handle_event(const cdc_acm_host_dev_event_data_t *event,
             bt_log(err_text);
             break;
         case CDC_ACM_HOST_DEVICE_DISCONNECTED:
-            snprintf(err_text, 128, ">>Device suddenly disconnected");
+            snprintf(err_text, sizeof(err_text),
+                     ">>Device suddenly disconnected");
             xSemaphoreTake(led_sync, portMAX_DELAY);
             led_vcp = 0;
             xSemaphoreGive(led_sync);
 
-            // ESP_LOGI(TAG, "%s", err_text);
+            ESP_LOGI(TAG, "%s", err_text);
             bt_log(err_text);
             xSemaphoreGive(device_disconnected_sem);
             break;
         case CDC_ACM_HOST_SERIAL_STATE:
-            snprintf(err_text, 128, "Serial state notif 0x%04X",
+            snprintf(err_text, sizeof(err_text), "Serial state notif 0x%04X",
                      event->data.serial_state.val);
             xSemaphoreTake(led_sync, portMAX_DELAY);
             led_vcp = 0;
             xSemaphoreGive(led_sync);
 
-            // ESP_LOGI(TAG, "%s", err_text);
+            ESP_LOGI(TAG, "%s", err_text);
             bt_log(err_text);
             break;
         case CDC_ACM_HOST_NETWORK_CONNECTION:
@@ -136,9 +148,6 @@ static void uart_tx_task(void *pvParameters) {
         }
 
         xQueueReceive(xQueueUartTX, &cmdBuf, portMAX_DELAY);
-        ////ESP_LOGI(pcTaskGetName(NULL), "cmdBuf.length=%d", cmdBuf.length);
-        // ESP_LOG_BUFFER_HEXDUMP(pcTaskGetName(NULL), cmdBuf.payload,
-        //                       cmdBuf.length, ESP_LOG_INFO);
         BaseType_t err = vcp->tx_blocking(cmdBuf.payload, cmdBuf.length, 1000);
         while (err == ESP_ERR_TIMEOUT) {
             ESP_LOGE(TAG, "uart_tx_task Timeout");
@@ -151,7 +160,6 @@ static void uart_tx_task(void *pvParameters) {
             led_tx = 1;
             xSemaphoreGive(led_sync);
         }
-        // vTaskDelay(20/portTICK_PERIOD_MS);
     }  // end while
     // Never reach here
     vTaskDelete(NULL);
@@ -170,44 +178,47 @@ static void uart_tx_task(void *pvParameters) {
  *   false: We expect more data
  */
 static bool handle_rx(const uint8_t *data, size_t data_len, void *arg) {
-    CMD_t cmdBuf;
-    cmdBuf.spp_event_id = BLE_UART_EVT;
-    cmdBuf.length = data_len;
-    memcpy(cmdBuf.payload, data, data_len);
-
-    BaseType_t err = xQueueSend(xQueueSpp, &cmdBuf, portMAX_DELAY);
-    if (err != pdTRUE) {
-        ESP_LOGE(pcTaskGetName(NULL), "xQueueSend Fail");
+    size_t offset = 0;
+    while (data_len > 0) {
+        CMD_t cmdBuf;
+        size_t chunk =
+            data_len > SPP_DATA_MAX_LEN ? SPP_DATA_MAX_LEN : data_len;
+        cmdBuf.spp_event_id = BLE_UART_EVT;
+        cmdBuf.length = chunk;
+        memcpy(cmdBuf.payload, data + offset, chunk);
+        if (uxQueueSpacesAvailable(xQueueSpp) > 0) {
+            BaseType_t err = xQueueSend(xQueueSpp, &cmdBuf, 0);
+            if (err != pdTRUE) {
+                ESP_LOGE(pcTaskGetName(NULL), "xQueueSend Fail");
+            }
+        } else {
+            ESP_LOGW(pcTaskGetName(NULL),
+                     "BLE TX queue full, dropping serial data");
+            return false;
+        }
+        offset += chunk;
+        data_len -= chunk;
     }
-
-    BaseType_t sem = xSemaphoreTake(led_sync, 1);
+    last_ble_activity = xTaskGetTickCount();
+    BaseType_t sem = xSemaphoreTake(led_sync, portMAX_DELAY);
     if (sem == pdTRUE) {
         led_rx = 1;
         xSemaphoreGive(led_sync);
     }
-
     return true;
 }
 
 static void vcp_open_task(void *arg) {
-    // Do everything else in a loop, so we can demonstrate USB device
-    // reconnections
+    // Do everything else in a loop, to handle USB device reconnections
     while (1) {
         const cdc_acm_host_device_config_t dev_config = {
-            .connection_timeout_ms =
-                5000,  // 5 seconds, enough time to plug the device in or
-                       // experiment with timeout
+            .connection_timeout_ms = BLE_TIMEOUT_MS,
             .out_buffer_size = 5120,
             .in_buffer_size = 5120,
             .event_cb = handle_event,
             .data_cb = handle_rx,
             .user_arg = NULL,
         };
-
-        // You don't need to know the device's VID and PID. Just plug in any
-        // device and the VCP service will load correct (already registered)
-        // driver for the device
-        // ESP_LOGI(TAG, "Opening any VCP device...");
 
         vcp = std::unique_ptr<CdcAcmDevice>(VCP::open(&dev_config));
 
@@ -218,54 +229,53 @@ static void vcp_open_task(void *arg) {
         }
         vTaskDelay(10);
 
-        // ESP_LOGI(TAG, "Setting up line coding");
         cdc_acm_line_coding_t line_coding = {
-            .dwDTERate = EXAMPLE_BAUDRATE,
-            .bCharFormat = EXAMPLE_STOP_BITS,
-            .bParityType = EXAMPLE_PARITY,
-            .bDataBits = EXAMPLE_DATA_BITS,
+            .dwDTERate = BAUDRATE,
+            .bCharFormat = STOP_BITS,
+            .bParityType = PARITY,
+            .bDataBits = DATA_BITS,
         };
         ESP_ERROR_CHECK(vcp->line_coding_set(&line_coding));
-
-        /*
-        Now the USB-to-UART converter is configured and receiving data.
-        You can use standard CDC-ACM API to interact with it. E.g.
-
-        ESP_ERROR_CHECK(vcp->set_control_line_state(false, true));
-        ESP_ERROR_CHECK(vcp->tx_blocking((uint8_t *)"Test string", 12));
-        */
 
         bt_log(">> Serial Device connected\n");
 
         xSemaphoreTake(led_sync, portMAX_DELAY);
         led_vcp = 1;
         xSemaphoreGive(led_sync);
-
-        // We are done. Wait for device disconnection and start over
-        // ESP_LOGI(TAG, "Done. You can reconnect the VCP device to run
-        // again.");
         xSemaphoreTake(device_disconnected_sem, portMAX_DELAY);
         vTaskDelay(10);
     }
 }
 
 static void bt_log(const char *data) {
-    char *log_text = new char[128];
-    snprintf(log_text, 128, "%s\r\n", data);
-    uint8_t data_len = strlen(log_text);
-    CMD_t cmdBuf;
-    cmdBuf.spp_event_id = BLE_UART_EVT;
-    cmdBuf.length = data_len;
-    memcpy(cmdBuf.payload, log_text, 128);
-
-    BaseType_t err = xQueueSend(xQueueSpp, &cmdBuf, portMAX_DELAY);
-    if (err != pdTRUE) {
-        ESP_LOGE(pcTaskGetName(NULL), "xQueueSend Fail");
+    size_t offset = 0;
+    size_t data_len = strlen(data);
+    while (data_len > 0) {
+        CMD_t cmdBuf;
+        size_t chunk =
+            data_len > SPP_DATA_MAX_LEN ? SPP_DATA_MAX_LEN : data_len;
+        cmdBuf.spp_event_id = BLE_UART_EVT;
+        cmdBuf.length = chunk;
+        memcpy(cmdBuf.payload, data + offset, chunk);
+        BaseType_t err = xQueueSend(xQueueSpp, &cmdBuf, portMAX_DELAY);
+        if (err != pdTRUE) {
+            ESP_LOGE(pcTaskGetName(NULL), "xQueueSend Fail");
+        }
+        offset += chunk;
+        data_len -= chunk;
     }
 }
 
+/**
+ * @brief Configure the LED strip
+ *
+ * Initializes the LED strip with the specified GPIO pin, LED count, and RMT
+ * configuration.
+ *
+ * @return led_strip_handle_t Handle to the initialized LED strip
+ */
 led_strip_handle_t configure_led(void) {
-    // LED strip general initialization, according to your led board design
+    // LED strip general initialization. It is only one on the dev board
     led_strip_config_t strip_config = {
         .strip_gpio_num = LED_STRIP_GPIO_PIN,  // The GPIO that connected to the
                                                // LED strip's data line
@@ -280,9 +290,8 @@ led_strip_handle_t configure_led(void) {
 
     // LED strip backend configuration: RMT
     led_strip_rmt_config_t rmt_config = {
-        .clk_src = RMT_CLK_SRC_DEFAULT,  // different clock source can lead to
-                                         // different power consumption
-        .resolution_hz = LED_STRIP_RMT_RES_HZ,  // RMT counter clock frequency
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz = LED_STRIP_RMT_RES_HZ,
         .mem_block_symbols =
             64,  // the memory size of each RMT channel, in words (4 bytes)
         .flags = {
@@ -294,12 +303,17 @@ led_strip_handle_t configure_led(void) {
     led_strip_handle_t led_strip;
     ESP_ERROR_CHECK(
         led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip));
-    // ESP_LOGI(TAG, "Created LED strip object with RMT backend");
     return led_strip;
 }
 
+/**
+ * @brief LED task to control the LED strip based on USB-Serial and BLE activity
+ *
+ * This task updates the LED color based on the current activity state.
+ * It uses a semaphore to synchronize access to the LED state variables.
+ */
 static void ledTask(void *arg) {
-    int l_rx, l_tx, l_vcp;
+    int l_rx, l_tx, l_vcp, l_ble;
     led_strip_handle_t led_strip = configure_led();
     ESP_ERROR_CHECK(led_strip_set_pixel(led_strip, 0, 0, 0, 0));
     ESP_ERROR_CHECK(led_strip_refresh(led_strip));
@@ -308,102 +322,142 @@ static void ledTask(void *arg) {
         l_rx = led_rx;
         l_tx = led_tx;
         l_vcp = led_vcp;
+        l_ble = led_ble;
         xSemaphoreGive(led_sync);
 
-        if (l_rx and l_tx and l_vcp) {
-            ESP_ERROR_CHECK(led_strip_set_pixel(led_strip, 0, 100, 100, 0));
-            ESP_ERROR_CHECK(led_strip_refresh(led_strip));
-            vTaskDelay(LED_BLINK_TIME / portTICK_PERIOD_MS);
-            ESP_ERROR_CHECK(led_strip_set_pixel(led_strip, 0, 0, 0, 20));
-            ESP_ERROR_CHECK(led_strip_refresh(led_strip));
-        } else {
-            if (l_rx and !(l_tx) and l_vcp) {
-                ESP_ERROR_CHECK(led_strip_set_pixel(led_strip, 0, 100, 0, 0));
-                ESP_ERROR_CHECK(led_strip_refresh(led_strip));
-                vTaskDelay(LED_BLINK_TIME / portTICK_PERIOD_MS);
-                ESP_ERROR_CHECK(led_strip_set_pixel(led_strip, 0, 0, 0, 20));
-                ESP_ERROR_CHECK(led_strip_refresh(led_strip));
+        uint8_t r = 0, g = 0, b = 0;
+        if (l_ble) {             // BLE connected
+            if (l_rx && l_tx) {  // Both RX and TX - yellow
+                r = 100;
+                g = 100;
+                b = 0;
+            } else if (l_rx) {  // RX only - red
+                r = 100;
+                g = 0;
+                b = 0;
+            } else if (l_tx) {  // TX only - green
+                r = 0;
+                g = 100;
+                b = 0;
+            } else {  // No traffic - purple
+                r = 80;
+                g = 0;
+                b = 80;
+            }
+        } else if (l_vcp) {  // USB-Serial connected
+            if (l_rx && l_tx) {
+                r = 100;
+                g = 100;
+                b = 0;
+            } else if (l_rx) {
+                r = 100;
+                g = 0;
+                b = 0;
+            } else if (l_tx) {
+                r = 0;
+                g = 100;
+                b = 0;
             } else {
-                if (!(l_rx) and l_tx and l_vcp) {
-                    ESP_ERROR_CHECK(
-                        led_strip_set_pixel(led_strip, 0, 0, 100, 0));
-                    ESP_ERROR_CHECK(led_strip_refresh(led_strip));
-                    vTaskDelay(LED_BLINK_TIME / portTICK_PERIOD_MS);
-                    ESP_ERROR_CHECK(
-                        led_strip_set_pixel(led_strip, 0, 0, 0, 20));
-                    ESP_ERROR_CHECK(led_strip_refresh(led_strip));
-                } else {
-                    if (!(l_rx) and !(l_tx) and l_vcp) {
-                        ESP_ERROR_CHECK(
-                            led_strip_set_pixel(led_strip, 0, 0, 0, 20));
-                        ESP_ERROR_CHECK(led_strip_refresh(led_strip));
-                        vTaskDelay(LED_BLINK_TIME / portTICK_PERIOD_MS);
-                        ESP_ERROR_CHECK(
-                            led_strip_set_pixel(led_strip, 0, 0, 0, 20));
-                        ESP_ERROR_CHECK(led_strip_refresh(led_strip));
-                    } else {
-                        if (l_rx and l_tx and !(l_vcp)) {
-                            ESP_ERROR_CHECK(
-                                led_strip_set_pixel(led_strip, 0, 100, 100, 0));
-                            ESP_ERROR_CHECK(led_strip_refresh(led_strip));
-                            vTaskDelay(LED_BLINK_TIME / portTICK_PERIOD_MS);
-                            ESP_ERROR_CHECK(
-                                led_strip_set_pixel(led_strip, 0, 0, 0, 0));
-                            ESP_ERROR_CHECK(led_strip_refresh(led_strip));
-                        } else {
-                            if (l_rx and !(l_tx) and !(l_vcp)) {
-                                ESP_ERROR_CHECK(led_strip_set_pixel(
-                                    led_strip, 0, 100, 0, 0));
-                                ESP_ERROR_CHECK(led_strip_refresh(led_strip));
-                                vTaskDelay(LED_BLINK_TIME / portTICK_PERIOD_MS);
-                                ESP_ERROR_CHECK(
-                                    led_strip_set_pixel(led_strip, 0, 0, 0, 0));
-                                ESP_ERROR_CHECK(led_strip_refresh(led_strip));
-                            } else {
-                                if (!(l_rx) and l_tx and !(l_vcp)) {
-                                    ESP_ERROR_CHECK(led_strip_set_pixel(
-                                        led_strip, 0, 0, 100, 0));
-                                    ESP_ERROR_CHECK(
-                                        led_strip_refresh(led_strip));
-                                    vTaskDelay(LED_BLINK_TIME /
-                                               portTICK_PERIOD_MS);
-                                    ESP_ERROR_CHECK(led_strip_set_pixel(
-                                        led_strip, 0, 0, 0, 0));
-                                    ESP_ERROR_CHECK(
-                                        led_strip_refresh(led_strip));
-                                } else {
-                                    if (!(l_rx) and !(l_tx) and !(l_vcp)) {
-                                        ESP_ERROR_CHECK(led_strip_set_pixel(
-                                            led_strip, 0, 0, 0, 0));
-                                        ESP_ERROR_CHECK(
-                                            led_strip_refresh(led_strip));
-                                        vTaskDelay(LED_BLINK_TIME /
-                                                   portTICK_PERIOD_MS);
-                                        ESP_ERROR_CHECK(led_strip_set_pixel(
-                                            led_strip, 0, 0, 0, 0));
-                                        ESP_ERROR_CHECK(
-                                            led_strip_refresh(led_strip));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                r = 0;
+                g = 0;
+                b = 20;
+            }
+        } else {  // Nothing connected
+            if (l_rx && l_tx) {
+                r = 100;
+                g = 100;
+                b = 0;
+            } else if (l_rx) {
+                r = 100;
+                g = 0;
+                b = 0;
+            } else if (l_tx) {
+                r = 0;
+                g = 100;
+                b = 0;
+            } else {
+                r = 0;
+                g = 0;
+                b = 0;
             }
         }
+        ESP_ERROR_CHECK(led_strip_set_pixel(led_strip, 0, r, g, b));
+        ESP_ERROR_CHECK(led_strip_refresh(led_strip));
+        vTaskDelay(LED_BLINK_TIME / portTICK_PERIOD_MS);
 
         xSemaphoreTake(led_sync, portMAX_DELAY);
-        if (l_rx) {
-            led_rx = 0;
-        }
-        if (l_tx) {
-            led_tx = 0;
-        }
+        if (l_rx) led_rx = 0;
+        if (l_tx) led_tx = 0;
         xSemaphoreGive(led_sync);
         vTaskDelay(LED_BLINK_TIME / portTICK_PERIOD_MS);
     }
 }
 
+/**
+ * @brief Initialize queues for SPP and UART communication
+ *
+ * This function allocates memory for the queues in PSRAM if available, or falls
+ * back to internal RAM if PSRAM allocation fails.
+ * Queues in PSRAM can be much bigger than in internal RAM, which is useful for
+ * handling larger data transfers without blocking when BLE connection is slow.
+ */
+static void init_queues() {
+    size_t cmd_size = sizeof(CMD_t);
+    void *spp_queue_storage = nullptr;
+    void *uart_queue_storage = nullptr;
+    StaticQueue_t *spp_queue_struct = nullptr;
+    StaticQueue_t *uart_queue_struct = nullptr;
+
+    if (esp_psram_is_initialized()) {
+        // Allocate queue storage buffers
+        spp_queue_storage = heap_caps_malloc(
+            SPP_QUEUE_LEN * cmd_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        uart_queue_storage = heap_caps_malloc(
+            UART_QUEUE_LEN * cmd_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+        // Allocate queue structures
+        spp_queue_struct = (StaticQueue_t *)heap_caps_malloc(
+            sizeof(StaticQueue_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        uart_queue_struct = (StaticQueue_t *)heap_caps_malloc(
+            sizeof(StaticQueue_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+
+        if (spp_queue_storage && uart_queue_storage && spp_queue_struct &&
+            uart_queue_struct) {
+            xQueueSpp = xQueueCreateStatic(SPP_QUEUE_LEN, cmd_size,
+                                           (uint8_t *)spp_queue_storage,
+                                           spp_queue_struct);
+            xQueueUartTX = xQueueCreateStatic(UART_QUEUE_LEN, cmd_size,
+                                              (uint8_t *)uart_queue_storage,
+                                              uart_queue_struct);
+            ESP_LOGI(TAG, "Queues allocated in PSRAM");
+        } else {
+            // Free any allocated memory before falling back
+            if (spp_queue_storage) heap_caps_free(spp_queue_storage);
+            if (uart_queue_storage) heap_caps_free(uart_queue_storage);
+            if (spp_queue_struct) heap_caps_free(spp_queue_struct);
+            if (uart_queue_struct) heap_caps_free(uart_queue_struct);
+
+            ESP_LOGW(TAG,
+                     "PSRAM allocation failed, falling back to internal RAM");
+            xQueueSpp = xQueueCreate(32, cmd_size);
+            xQueueUartTX = xQueueCreate(32, cmd_size);
+        }
+    } else {
+        xQueueSpp = xQueueCreate(32, cmd_size);
+        xQueueUartTX = xQueueCreate(32, cmd_size);
+        ESP_LOGI(TAG, "Queues allocated in internal RAM");
+    }
+
+    configASSERT(xQueueSpp);
+    configASSERT(xQueueUartTX);
+}
+
+/**
+ * @brief Main application entry point
+ *
+ * Initializes NVS, installs USB Host driver, creates tasks, and starts the
+ * application.
+ */
 extern "C" void app_main(void) {
     device_disconnected_sem = xSemaphoreCreateBinary();
     assert(device_disconnected_sem);
@@ -439,11 +493,8 @@ extern "C" void app_main(void) {
     VCP::register_driver<CP210x>();
     VCP::register_driver<CH34x>();
 
-    // Create Queue
-    xQueueSpp = xQueueCreate(10, sizeof(CMD_t));
-    configASSERT(xQueueSpp);
-    xQueueUartTX = xQueueCreate(10, sizeof(CMD_t));
-    configASSERT(xQueueUartTX);
+    // Neue Queue-Initialisierung
+    init_queues();
 
     // Start tasks
     xTaskCreate(uart_tx_task, "UART-TX", 1024 * 4, NULL, 2, NULL);
